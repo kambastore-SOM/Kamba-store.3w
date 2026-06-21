@@ -1,31 +1,39 @@
 const express = require('express');
 const multer = require('multer');
-const fs = require('fs');
 const path = require('path');
+const { MongoClient } = require('mongodb');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-
-const DATA_DIR = path.join(__dirname, 'data');
-const UPLOADS_DIR = path.join(__dirname, 'uploads');
-const DATA_FILE = path.join(DATA_DIR, 'store.json');
 const MANAGER_PASSWORD = 'kamba2025';
 
-// Ensure folders exist
-if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
-if (!fs.existsSync(UPLOADS_DIR)) fs.mkdirSync(UPLOADS_DIR, { recursive: true });
+// ===== MONGODB CONFIG =====
+// Cola aqui a tua connection string do MongoDB Atlas
+const MONGO_URI = process.env.MONGO_URI || 'COLA_AQUI_A_TUA_CONNECTION_STRING';
+const DB_NAME = 'kamba_store';
+const COLLECTION_DATA = 'store_data';
+const COLLECTION_PHOTOS = 'photos';
 
-// Multer setup for image uploads
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, UPLOADS_DIR),
-  filename: (req, file, cb) => {
-    const ext = path.extname(file.originalname) || '.jpg';
-    const name = 'img_' + Date.now() + '_' + Math.round(Math.random() * 1e9) + ext;
-    cb(null, name);
+let db = null;
+let mongoConnected = false;
+
+async function connectMongo() {
+  try {
+    const client = new MongoClient(MONGO_URI);
+    await client.connect();
+    db = client.db(DB_NAME);
+    mongoConnected = true;
+    console.log('✅ MongoDB conectado com sucesso');
+  } catch (e) {
+    console.error('❌ Erro ao conectar MongoDB:', e.message);
+    mongoConnected = false;
   }
-});
+}
+connectMongo();
+
+// Multer setup - keep files in memory (not disk) since disk is not persistent
 const upload = multer({
-  storage,
+  storage: multer.memoryStorage(),
   limits: { fileSize: 5 * 1024 * 1024 }, // 5MB max per photo
   fileFilter: (req, file, cb) => {
     if (file.mimetype.startsWith('image/')) cb(null, true);
@@ -33,9 +41,8 @@ const upload = multer({
   }
 });
 
-app.use(express.json({ limit: '5mb' }));
+app.use(express.json({ limit: '8mb' }));
 app.use(express.static(path.join(__dirname, 'public')));
-app.use('/uploads', express.static(UPLOADS_DIR));
 
 // ===== DEFAULT DATA =====
 const defaultProducts = [
@@ -91,46 +98,83 @@ const defaultData = {
   cssRed: '#D62828', cssDark: '#141414', cssDark2: '#1E1E1E', cssBlack: '#0A0A0A',
 };
 
-function loadData() {
+async function loadData() {
+  if (!mongoConnected) return defaultData;
   try {
-    if (fs.existsSync(DATA_FILE)) return JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
-  } catch (e) { console.error('Load error:', e); }
+    const doc = await db.collection(COLLECTION_DATA).findOne({ _id: 'main' });
+    if (doc && doc.data) return doc.data;
+  } catch (e) {
+    console.error('Load error:', e.message);
+  }
   return defaultData;
 }
-function saveData(data) {
-  fs.writeFileSync(DATA_FILE, JSON.stringify(data), 'utf8');
+
+async function saveData(data) {
+  if (!mongoConnected) throw new Error('MongoDB não está ligado');
+  await db.collection(COLLECTION_DATA).updateOne(
+    { _id: 'main' },
+    { $set: { data, updatedAt: new Date() } },
+    { upsert: true }
+  );
 }
 
 // ===== API ROUTES =====
 
-// Get all store data
-app.get('/api/data', (req, res) => {
-  res.json(loadData());
+app.get('/api/data', async (req, res) => {
+  const data = await loadData();
+  res.json(data);
 });
 
-// Save all store data (requires password)
-app.post('/api/data', (req, res) => {
+app.post('/api/data', async (req, res) => {
   const { password, data } = req.body;
   if (password !== MANAGER_PASSWORD) {
     return res.status(401).json({ error: 'Senha incorrecta' });
   }
   try {
-    saveData(data);
+    await saveData(data);
     res.json({ success: true });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
 
-// Upload a photo - returns a public URL
-app.post('/api/upload', upload.single('photo'), (req, res) => {
+// Upload a photo - stores in MongoDB as base64, returns a URL that serves it back
+app.post('/api/upload', upload.single('photo'), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'Nenhuma foto enviada' });
-  const url = '/uploads/' + req.file.filename;
-  res.json({ success: true, url });
+  if (!mongoConnected) return res.status(500).json({ error: 'Base de dados não disponível' });
+  try {
+    const id = 'img_' + Date.now() + '_' + Math.round(Math.random() * 1e9);
+    const base64 = req.file.buffer.toString('base64');
+    const mimeType = req.file.mimetype;
+    await db.collection(COLLECTION_PHOTOS).insertOne({
+      _id: id,
+      data: base64,
+      mimeType,
+      createdAt: new Date()
+    });
+    res.json({ success: true, url: '/api/photo/' + id });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Serve a stored photo
+app.get('/api/photo/:id', async (req, res) => {
+  if (!mongoConnected) return res.status(404).send('Not found');
+  try {
+    const doc = await db.collection(COLLECTION_PHOTOS).findOne({ _id: req.params.id });
+    if (!doc) return res.status(404).send('Photo not found');
+    const buffer = Buffer.from(doc.data, 'base64');
+    res.set('Content-Type', doc.mimeType || 'image/jpeg');
+    res.set('Cache-Control', 'public, max-age=31536000');
+    res.send(buffer);
+  } catch (e) {
+    res.status(500).send('Error loading photo');
+  }
 });
 
 // Health check
-app.get('/api/ping', (req, res) => res.json({ ok: true, time: new Date().toISOString() }));
+app.get('/api/ping', (req, res) => res.json({ ok: true, mongoConnected, time: new Date().toISOString() }));
 
 // Serve frontend for all other routes
 app.get('*', (req, res) => {
